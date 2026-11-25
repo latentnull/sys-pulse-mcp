@@ -4,7 +4,17 @@ use std::{
     process::{Command, Output},
 };
 
-use rmcp::{handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router};
+use rmcp::{
+    ServerHandler,
+    handler::server::{router::prompt::PromptRouter, tool::ToolRouter, wrapper::Parameters},
+    model::{
+        CallToolResult, ErrorData, GetPromptResult, Implementation, ListResourceTemplatesResult,
+        ListResourcesResult, PromptMessage, ReadResourceRequestParams, ReadResourceResponse,
+        ReadResourceResult, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
+        ServerConfig,
+    },
+    prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -27,17 +37,41 @@ pub struct RepoStatusInput {
     pub path: String,
 }
 
+/// Arguments for the bottleneck diagnosis prompt.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DiagnoseBottleneckArguments {
+    /// Describe the system symptom or workload to investigate.
+    pub symptom: String,
+    /// Optional workload details such as workload type or when it occurs.
+    pub workload: Option<String>,
+}
+
+/// Arguments for the pre-push review prompt.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PrePushCheckArguments {
+    /// Repository path relative to an allowed base directory.
+    pub path: String,
+}
+
 /// Read-only system inspection tools exposed over MCP.
 #[derive(Clone)]
-pub struct SysPulseServer;
+pub struct SysPulseServer {
+    tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
+}
 
-#[tool_router(server_handler)]
 impl SysPulseServer {
-    /// Create a server with its tool router.
+    /// Create a server with its tool and prompt routers.
     pub fn new() -> Self {
-        Self
+        Self {
+            tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
+        }
     }
+}
 
+#[tool_router]
+impl SysPulseServer {
     /// Report CPU, memory, operating system, and uptime details.
     #[tool(
         description = "Return CPU count and usage, total and available RAM, OS details, and uptime.",
@@ -103,7 +137,151 @@ impl SysPulseServer {
     }
 }
 
-fn system_overview_data() -> Result<Value, String> {
+#[prompt_router]
+impl SysPulseServer {
+    /// Guide a focused diagnosis using live system telemetry.
+    #[prompt(
+        description = "Create a structured diagnostic workflow for investigating a system bottleneck."
+    )]
+    fn diagnose_bottleneck(
+        &self,
+        Parameters(arguments): Parameters<DiagnoseBottleneckArguments>,
+    ) -> GetPromptResult {
+        let telemetry = system_overview_data()
+            .map(|data| serde_json::to_string_pretty(&data).unwrap_or_else(|_| "{}".to_owned()))
+            .unwrap_or_else(|error| format!("Telemetry unavailable: {error}"));
+        let workload = arguments
+            .workload
+            .map(|value| format!("\nWorkload details: {value}"))
+            .unwrap_or_default();
+        GetPromptResult::new(vec![PromptMessage::new_text(
+            Role::User,
+            format!(
+                "Diagnose this system symptom: {}\n\
+                 Distinguish CPU, memory, disk, and workload causes. Separate observations \
+                 from hypotheses, suggest safe read-only checks, and ask for missing evidence \
+                 rather than assuming a cause.{workload}\n\n\
+                 Current telemetry snapshot:\n{telemetry}",
+                arguments.symptom
+            ),
+        )])
+        .with_description("A telemetry-grounded, read-only bottleneck investigation.")
+    }
+
+    /// Prepare a structured pre-push review of an allowlisted Git repository.
+    #[prompt(
+        description = "Review the current status of an allowlisted Git repository before pushing."
+    )]
+    fn pre_push_check(
+        &self,
+        Parameters(arguments): Parameters<PrePushCheckArguments>,
+    ) -> GetPromptResult {
+        let status = inspect_repo(&arguments.path)
+            .map(|value| serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_owned()))
+            .unwrap_or_else(|error| {
+                format!(
+                    "Repository status unavailable ({}): {}",
+                    error.code, error.message
+                )
+            });
+        GetPromptResult::new(vec![PromptMessage::new_text(
+            Role::User,
+            format!(
+                "Review this repository before a push. Check the branch, working-tree changes, \
+                 and latest commit; identify any obvious release or verification follow-ups. \
+                 Do not run commands or modify files. Report findings and suggested checks.\n\n\
+                 Repository status:\n{status}"
+            ),
+        )])
+        .with_description("A read-only pre-push repository review.")
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
+impl ServerHandler for SysPulseServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "sys-pulse-mcp",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "Read-only local system telemetry, allowlisted repository inspection, and diagnostic prompts.",
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new("sys://telemetry/snapshot", "System telemetry snapshot")
+                .with_description("A fresh snapshot of CPU, memory, operating system, and uptime.")
+                .with_mime_type("application/json"),
+        ]))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        Ok(ListResourceTemplatesResult::with_all_items(vec![
+            ResourceTemplate::new("sys://repositories/{path}", "Allowlisted repository status")
+                .with_description(
+                    "Read-only Git status for a repository beneath SYS_PULSE_ALLOWED_BASES.",
+                )
+                .with_mime_type("application/json"),
+        ]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let contents = if request.uri == "sys://telemetry/snapshot" {
+            let snapshot = system_overview_data().map_err(|error| {
+                ErrorData::internal_error(format!("Could not collect telemetry: {error}"), None)
+            })?;
+            let text = serde_json::to_string_pretty(&snapshot).map_err(|error| {
+                ErrorData::internal_error(format!("Could not serialize telemetry: {error}"), None)
+            })?;
+            ResourceContents::text(text, request.uri)
+        } else if let Some(path) = request.uri.strip_prefix("sys://repositories/") {
+            let status = inspect_repo(path).map_err(|error| {
+                ErrorData::resource_not_found(
+                    format!("Repository resource is unavailable: {}", error.message),
+                    Some(json!({ "error_code": error.code })),
+                )
+            })?;
+            let text = serde_json::to_string_pretty(&status).map_err(|error| {
+                ErrorData::internal_error(
+                    format!("Could not serialize repository status: {error}"),
+                    None,
+                )
+            })?;
+            ResourceContents::text(text, request.uri)
+        } else {
+            return Err(ErrorData::resource_not_found(
+                "Unknown sys-pulse resource URI.",
+                None,
+            ));
+        };
+
+        Ok(ReadResourceResult::new(vec![contents]).into())
+    }
+}
+
+pub(crate) fn system_overview_data() -> Result<Value, String> {
     let mut system = System::new().map_err(|error| error.to_string())?;
     system.refresh_cpu_all();
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -306,7 +484,11 @@ fn count_dirty_files(status: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{RepoStatusError, count_dirty_files, resolve_repo_path};
+    use super::{
+        DiagnoseBottleneckArguments, PrePushCheckArguments, RepoStatusError, SysPulseServer,
+        count_dirty_files, resolve_repo_path,
+    };
+    use rmcp::{ServerHandler, handler::server::wrapper::Parameters};
     use std::{
         fs,
         path::PathBuf,
@@ -392,5 +574,41 @@ mod tests {
     fn counts_changed_files_in_nul_delimited_porcelain_output() {
         let status = b" M modified file\0?? untracked file\0R  renamed file\0old name\0";
         assert_eq!(count_dirty_files(status), 3);
+    }
+
+    #[test]
+    fn advertises_tools_prompts_and_resources() {
+        let server = SysPulseServer::new();
+        let info = server.get_info();
+
+        assert!(info.capabilities.tools.is_some());
+        assert!(info.capabilities.prompts.is_some());
+        assert!(info.capabilities.resources.is_some());
+    }
+
+    #[test]
+    fn bottleneck_prompt_includes_symptom_and_optional_workload() {
+        let server = SysPulseServer::new();
+        let prompt = server.diagnose_bottleneck(Parameters(DiagnoseBottleneckArguments {
+            symptom: "slow builds".to_owned(),
+            workload: Some("parallel Rust compilation".to_owned()),
+        }));
+        let output = serde_json::to_string(&prompt).expect("prompt serializes");
+
+        assert!(output.contains("slow builds"));
+        assert!(output.contains("parallel Rust compilation"));
+        assert!(output.contains("Current telemetry snapshot"));
+    }
+
+    #[test]
+    fn pre_push_prompt_reports_repository_status_or_validation_error() {
+        let server = SysPulseServer::new();
+        let prompt = server.pre_push_check(Parameters(PrePushCheckArguments {
+            path: "../outside".to_owned(),
+        }));
+        let output = serde_json::to_string(&prompt).expect("prompt serializes");
+
+        assert!(output.contains("read-only"));
+        assert!(output.contains("INVALID_PATH"));
     }
 }
