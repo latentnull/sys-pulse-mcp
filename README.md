@@ -1,107 +1,117 @@
 # sys-pulse-mcp
 
-A read-only, stdio-based Model Context Protocol server for local system and Git
-repository inspection. Built with Rust, [`rmcp`](https://crates.io/crates/rmcp),
-Tokio, and `sysinfo`.
+A read-only, stdio-based [Model Context Protocol](https://modelcontextprotocol.io/)
+server for local system telemetry, Git status, and practical diagnostics. Built
+with Rust, [`rmcp`](https://crates.io/crates/rmcp), Tokio, and `sysinfo`.
 
 ## Features
 
-- Reports CPU, memory, operating-system, and uptime information.
-- Lists mounted filesystems with total and available space.
-- Inspects a repository's current branch, dirty-file count, and latest commit.
-- Keeps MCP JSON-RPC frames on stdout and sends diagnostic logs only to stderr.
-- Restricts repository lookups to explicitly allowed base directories.
+- System CPU, memory, operating-system, and uptime telemetry.
+- Mounted disk usage and top-process inspection by CPU or resident memory.
+- Local loopback TCP listening-port checks and optional NVIDIA GPU telemetry.
+- Allowlisted, read-only Git repository status and a corresponding MCP resource.
+- Structured diagnosis and pre-push prompt workflows.
+- Stdio JSON-RPC is kept on stdout; diagnostic logs are sent to stderr.
 
 ## Requirements
 
 - Rust 1.95 or newer.
-- Git available on `PATH` for the `repo_status` tool.
+- Git on `PATH` for repository tools and resources.
+- NVIDIA drivers/NVML and a supported NVIDIA GPU only for `gpu_telemetry`.
+  Other tools work without NVIDIA hardware.
 
 ## Build and run
 
 ```powershell
 cargo build --release
-cargo run --release
+cargo run --release -- --allow-dir C:\Work\Projects
 ```
+
+`--allow-dir <path>` may be repeated to authorize multiple repository roots.
+When no CLI paths are supplied, the server reads `SYS_PULSE_ALLOWED_BASES`
+(platform-separated paths); if that variable is unset, it uses the process
+working directory. Configured directories are canonicalized and validated at
+startup. Repository lookups reject absolute paths, parent traversal, and paths
+that resolve outside those bases.
 
 The server communicates over standard input/output and is intended to be
 launched by an MCP client. Do not pipe other application output to stdout.
 Tracing output is configured to stderr.
 
-## Tools
+## MCP tools
 
 All tools are read-only and use object-shaped JSON input schemas.
 
-### `system_overview`
+| Tool | Input | Result |
+| --- | --- | --- |
+| `system_overview` | `{}` | CPU count and usage, total/available RAM, OS details, host name, and uptime. |
+| `disk_usage` | `{}` | Mounted disks with filesystem, mount point, and total/available bytes. |
+| `repo_status` | `{"path":"relative/repo"}` | Canonical path, branch, dirty-file count, and latest commit summary. |
+| `top_processes` | `{"limit":10,"sort":"cpu"}` | Up to 100 processes, ordered by `cpu` or `memory`; limit defaults to 10. |
+| `port_check` | `{"ports":[80,443]}` | Whether each requested port accepts TCP connections on `127.0.0.1`. |
+| `gpu_telemetry` | `{}` | NVIDIA GPU name, VRAM, temperature, and utilization using NVML. |
 
-Input: `{}`.
+`port_check` only tests loopback and accepts at most 64 ports per call; it does
+not probe remote hosts. `gpu_telemetry` returns a structured tool-level error
+(`GPU_TELEMETRY_UNAVAILABLE`) when NVML or a supported NVIDIA GPU is unavailable.
+Likewise, invalid or non-repository paths return structured tool-level errors
+instead of failing the MCP protocol request.
 
-Returns `cpu_count`, `cpu_usage_percent`, `memory_total_bytes`,
-`memory_available_bytes`, OS name/version, host name, and `uptime_seconds`.
+## MCP resources
 
-### `disk_usage`
+- `sys://telemetry/snapshot` provides a fresh JSON snapshot of CPU, memory, OS,
+  host, and uptime data.
+- The `sys://repositories/{path}` resource template provides JSON Git status
+  for a repository beneath an allowed base directory. The `{path}` value must
+  be relative and cannot traverse outside configured roots.
 
-Input: `{}`.
+## MCP prompts
 
-Returns a `disks` array. Each entry contains the disk name, filesystem,
-mount point, `total_space_bytes`, and `available_space_bytes`.
+- `diagnose_bottleneck` accepts required `symptom` and optional `workload`
+  arguments. It combines the described symptom with current telemetry and
+  guides a focused, read-only investigation.
+- `pre_push_check` accepts a repository `path` relative to an allowed base and
+  creates a read-only review prompt from the current branch, dirty-file count,
+  and latest commit.
 
-### `repo_status`
-
-Input:
-
-```json
-{ "path": "relative/path/to/repository" }
-```
-
-Returns the canonical repository path, current branch (or `null` when detached),
-`dirty_file_count`, and the latest commit summary (or `null` for a repository
-without commits). Invalid, missing, or non-repository paths produce an MCP
-tool-level error with structured `error_code` and `message` fields; they do not
-fail the JSON-RPC request.
-
-By default, relative paths resolve beneath the server's working directory.
-Set `SYS_PULSE_ALLOWED_BASES` to a platform-separated list of allowed base
-directories to customize access. The server canonicalizes both bases and
-requested paths, rejects absolute paths and parent traversal, and checks the
-resolved path remains beneath an allowed base. On Windows, separate bases with
-`;`; on Unix, use `:`.
+Both prompts return structured MCP `GetPromptResult` messages. They suggest
+analysis and checks; they do not run shell commands or modify repositories.
 
 ## MCP client configuration
 
-Example configuration for an MCP client that accepts a `command` and `args`
-stdio server entry:
+Example stdio-server configuration for an MCP client that accepts `command` and
+`args`:
 
 ```json
 {
   "mcpServers": {
     "sys-pulse": {
       "command": "C:\\Work\\Projects\\sys-pulse-mcp\\target\\release\\sys-pulse-mcp.exe",
-      "args": [],
-      "env": {
-        "SYS_PULSE_ALLOWED_BASES": "C:\\Work\\Projects"
-      }
+      "args": [
+        "--allow-dir",
+        "C:\\Work\\Projects"
+      ]
     }
   }
 }
 ```
 
-Build the executable first with `cargo build --release`. Configure the allowed
-base to the narrowest directory that contains repositories the client should
-be able to inspect.
+Repeat the `--allow-dir`, `<path>` pair in `args` to authorize additional
+directories. Alternatively, omit those arguments and configure
+`SYS_PULSE_ALLOWED_BASES` in the MCP client's `env` object.
 
 ## Architecture
 
-- `src/main.rs` configures stderr-only tracing, creates the MCP service, and
-  serves it over rmcp's stdio transport.
-- `src/tools.rs` owns the tool router, documented `JsonSchema` input types,
-  system/disk inspections, Git status collection, and path validation.
-- `SYS_PULSE_ALLOWED_BASES` is the access boundary for `repo_status`; it
-  defaults to the process working directory.
+- `src/main.rs` configures stderr-only tracing, parses CLI allowlist options,
+  creates the MCP service, and serves it over rmcp's stdio transport.
+- `src/tools.rs` contains the typed tool and prompt routers, MCP resource
+  handlers, telemetry/Git inspection, and path-validation logic.
+- `SYS_PULSE_ALLOWED_BASES` and repeatable `--allow-dir` options define the
+  repository access boundary.
 
-The server disables Git's optional index writes and filesystem-monitor hook
-while inspecting repositories, and invokes Git only with argument arrays
-(never through a shell).
+The server performs no writes to inspected repositories and invokes Git only
+with argument arrays (never through a shell). Process and port diagnostics are
+restricted to local observation; port checks connect only to IPv4 loopback.
 
 ## Development
 
@@ -111,5 +121,5 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
-GitHub Actions runs the same formatting, lint, and test checks on pushes and
-pull requests.
+GitHub Actions runs formatting, Clippy, and tests on pushes and pull requests.
+See [CHANGELOG.md](CHANGELOG.md) for the milestone-by-milestone feature history.
