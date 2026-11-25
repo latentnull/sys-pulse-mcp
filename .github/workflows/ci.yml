@@ -10,7 +10,10 @@ permissions:
 jobs:
   rust:
     name: Format, lint, and test
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4

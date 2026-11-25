@@ -36,3 +36,9 @@
 - feat(workspace): report allowlisted Git status, upstream commit count, and sizes of common build caches without following symlinks.
 - feat(diagnostics): add compact summaries for process, port, GPU, and workspace diagnostics.
 - test(diagnostics): cover cache sizing, compact output, path validation, and local port lookup.
+
+## v0.6 — Testable Providers & Cross-Platform CI
+
+- refactor(core): route system, disk, process, GPU, port, and sampler telemetry through a shared `TelemetryProvider`.
+- test(core): add a deterministic mock provider for stable MCP handler and prompt tests without host telemetry dependencies.
+- ci(github-actions): run formatting, Clippy, and tests on Ubuntu and Windows.

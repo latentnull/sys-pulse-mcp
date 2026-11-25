@@ -11,7 +11,7 @@ use std::{
 };
 
 use rmcp::{ServiceExt, transport::stdio};
-use telemetry::{SampleHistory, run_sampler};
+use telemetry::{SampleHistory, SystemTelemetryProvider, TelemetryProvider, run_sampler};
 use tools::SysPulseServer;
 
 #[tokio::main]
@@ -35,14 +35,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Ok(());
     }
 
+    let provider: Arc<dyn TelemetryProvider> =
+        Arc::new(SystemTelemetryProvider::new().map_err(std::io::Error::other)?);
     let server = match options.allow_dirs {
         Some(allow_dirs) => {
-            SysPulseServer::with_allowed_bases(allow_dirs).map_err(std::io::Error::other)?
+            SysPulseServer::with_allowed_bases_and_provider(allow_dirs, Arc::clone(&provider))
+                .map_err(std::io::Error::other)?
         }
-        None => SysPulseServer::new().map_err(std::io::Error::other)?,
+        None => {
+            SysPulseServer::with_provider(Arc::clone(&provider)).map_err(std::io::Error::other)?
+        }
     };
     let history = Arc::new(RwLock::new(SampleHistory::default()));
     let sampler = tokio::spawn(run_sampler(
+        Arc::clone(&provider),
         Arc::clone(&history),
         Duration::from_secs(options.sample_interval_secs),
     ));

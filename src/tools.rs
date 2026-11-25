@@ -6,8 +6,6 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState, get_sockets_info};
-use nvml_wrapper::{Nvml, enum_wrappers::device::TemperatureSensor};
 use rmcp::{
     ServerHandler,
     handler::server::{router::prompt::PromptRouter, tool::ToolRouter, wrapper::Parameters},
@@ -20,13 +18,10 @@ use rmcp::{
     prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
-use sysinfo::{
-    Disks, MINIMUM_CPU_UPDATE_INTERVAL, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
-};
 
-use crate::telemetry::SampleHistory;
+use crate::telemetry::{ProcessSort, SampleHistory, TelemetryProvider};
 
 const ALLOWED_BASES_ENV: &str = "SYS_PULSE_ALLOWED_BASES";
 const DEFAULT_PROCESS_LIMIT: usize = 10;
@@ -63,17 +58,6 @@ pub struct DiagnoseBottleneckArguments {
 pub struct PrePushCheckArguments {
     /// Repository path relative to an allowed base directory.
     pub path: String,
-}
-
-/// Sorting key for the top-processes tool.
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProcessSort {
-    /// Sort processes by CPU utilization, descending.
-    #[default]
-    Cpu,
-    /// Sort processes by resident memory, descending.
-    Memory,
 }
 
 /// Input for listing the busiest processes.
@@ -119,11 +103,11 @@ pub struct SysPulseServer {
     prompt_router: PromptRouter<Self>,
     allowed_bases: Vec<PathBuf>,
     sample_history: Arc<RwLock<SampleHistory>>,
+    provider: Arc<dyn TelemetryProvider>,
 }
 
 impl SysPulseServer {
-    /// Create a server with its tool and prompt routers.
-    pub fn new() -> Result<Self, String> {
+    pub fn with_provider(provider: Arc<dyn TelemetryProvider>) -> Result<Self, String> {
         let configured = match env::var_os(ALLOWED_BASES_ENV) {
             Some(value) => env::split_paths(&value).collect(),
             None => vec![
@@ -131,11 +115,13 @@ impl SysPulseServer {
                     .map_err(|error| format!("Could not determine current directory: {error}"))?,
             ],
         };
-        Self::with_allowed_bases(configured)
+        Self::with_allowed_bases_and_provider(configured, provider)
     }
 
-    /// Create a server restricted to the supplied allowlisted base directories.
-    pub fn with_allowed_bases(allowed_bases: Vec<PathBuf>) -> Result<Self, String> {
+    pub fn with_allowed_bases_and_provider(
+        allowed_bases: Vec<PathBuf>,
+        provider: Arc<dyn TelemetryProvider>,
+    ) -> Result<Self, String> {
         if allowed_bases.is_empty() {
             return Err("At least one allowed base directory must be configured.".to_owned());
         }
@@ -159,12 +145,21 @@ impl SysPulseServer {
             prompt_router: Self::prompt_router(),
             allowed_bases,
             sample_history: Arc::new(RwLock::new(SampleHistory::default())),
+            provider,
         })
     }
 
     pub fn with_sample_history(mut self, history: Arc<RwLock<SampleHistory>>) -> Self {
         self.sample_history = history;
         self
+    }
+
+    #[cfg(test)]
+    fn with_mock_provider(allowed_bases: Vec<PathBuf>) -> Result<Self, String> {
+        Self::with_allowed_bases_and_provider(
+            allowed_bases,
+            Arc::new(crate::telemetry::MockTelemetryProvider::default()),
+        )
     }
 }
 
@@ -179,7 +174,7 @@ impl SysPulseServer {
         &self,
         Parameters(_input): Parameters<SystemOverviewInput>,
     ) -> CallToolResult {
-        match system_overview_data() {
+        match self.provider.system_overview() {
             Ok(data) => CallToolResult::structured(data),
             Err(message) => CallToolResult::structured_error(json!({
                 "error_code": "SYSTEM_INSPECTION_FAILED",
@@ -202,7 +197,10 @@ impl SysPulseServer {
             }));
         }
 
-        match top_processes_data(limit, input.sort.unwrap_or_default()) {
+        match self
+            .provider
+            .top_processes(limit, input.sort.unwrap_or_default())
+        {
             Ok(processes) => {
                 let sort = input.sort.unwrap_or_default();
                 let result = json!({
@@ -228,10 +226,23 @@ impl SysPulseServer {
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     fn port_check(&self, Parameters(input): Parameters<PortCheckInput>) -> CallToolResult {
-        match port_lookup_data(&input.ports, input.compact.unwrap_or(false)) {
-            Ok(results) => CallToolResult::structured(results),
-            Err(message) => CallToolResult::structured_error(json!({
+        if input.ports.is_empty() || input.ports.len() > MAX_PORTS_PER_REQUEST {
+            return CallToolResult::structured_error(json!({
                 "error_code": "INVALID_PORTS",
+                "message": format!("Provide 1 to {MAX_PORTS_PER_REQUEST} TCP ports."),
+            }));
+        }
+        match self.provider.port_owners(&input.ports) {
+            Ok(ports) => {
+                let result = json!({ "ports": ports });
+                CallToolResult::structured(if input.compact.unwrap_or(false) {
+                    compact_port_result(&result)
+                } else {
+                    result
+                })
+            }
+            Err(message) => CallToolResult::structured_error(json!({
+                "error_code": "PORT_LOOKUP_FAILED",
                 "message": message,
             })),
         }
@@ -244,7 +255,7 @@ impl SysPulseServer {
     )]
     fn gpu_telemetry(&self, Parameters(_input): Parameters<GpuTelemetryInput>) -> CallToolResult {
         let compact = _input.compact.unwrap_or(false);
-        match gpu_telemetry_data() {
+        match self.provider.gpu_telemetry() {
             Ok(gpus) => {
                 let result = json!({ "gpus": gpus });
                 CallToolResult::structured(if compact {
@@ -285,29 +296,13 @@ impl SysPulseServer {
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     fn disk_usage(&self, Parameters(_input): Parameters<DiskUsageInput>) -> CallToolResult {
-        let disks = match Disks::new_with_refreshed_list() {
-            Ok(disks) => disks,
-            Err(error) => {
-                return CallToolResult::structured_error(json!({
-                    "error_code": "DISK_INSPECTION_FAILED",
-                    "message": error.to_string(),
-                }));
-            }
-        };
-        let entries: Vec<Value> = disks
-            .iter()
-            .map(|disk| {
-                json!({
-                    "name": disk.name().to_string_lossy(),
-                    "file_system": disk.file_system().to_string_lossy(),
-                    "mount_point": disk.mount_point().to_string_lossy(),
-                    "total_space_bytes": disk.total_space(),
-                    "available_space_bytes": disk.available_space(),
-                })
-            })
-            .collect();
-
-        CallToolResult::structured(json!({ "disks": entries }))
+        match self.provider.disk_usage() {
+            Ok(disks) => CallToolResult::structured(disks),
+            Err(error) => CallToolResult::structured_error(json!({
+                "error_code": "DISK_INSPECTION_FAILED",
+                "message": error,
+            })),
+        }
     }
 
     /// Return the current branch, dirty-file count, and latest commit for a repository.
@@ -336,7 +331,9 @@ impl SysPulseServer {
         &self,
         Parameters(arguments): Parameters<DiagnoseBottleneckArguments>,
     ) -> GetPromptResult {
-        let telemetry = system_overview_data()
+        let telemetry = self
+            .provider
+            .system_overview()
             .map(|data| serde_json::to_string_pretty(&data).unwrap_or_else(|_| "{}".to_owned()))
             .unwrap_or_else(|error| format!("Telemetry unavailable: {error}"));
         let workload = arguments
@@ -445,7 +442,7 @@ impl ServerHandler for SysPulseServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         let contents = if request.uri == "sys://telemetry/snapshot" {
-            let mut snapshot = system_overview_data().map_err(|error| {
+            let mut snapshot = self.provider.system_overview().map_err(|error| {
                 ErrorData::internal_error(format!("Could not collect telemetry: {error}"), None)
             })?;
             let trends = self.sample_history.read().map_err(|error| {
@@ -497,219 +494,6 @@ impl ServerHandler for SysPulseServer {
     }
 }
 
-pub(crate) fn system_overview_data() -> Result<Value, String> {
-    let mut system = System::new().map_err(|error| error.to_string())?;
-    system.refresh_cpu_all();
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    system.refresh_cpu_all();
-    system.refresh_memory();
-
-    let os_name = System::name().map_err(|error| error.to_string())?;
-    let os_version = System::os_version().map_err(|error| error.to_string())?;
-    let os_long_version = System::long_os_version().map_err(|error| error.to_string())?;
-    let host_name = System::host_name().map_err(|error| error.to_string())?;
-    let uptime_seconds = System::uptime().map_err(|error| error.to_string())?;
-
-    Ok(json!({
-        "cpu_count": system.cpus().len(),
-        "cpu_usage_percent": system.global_cpu_usage(),
-        "memory_total_bytes": system.total_memory(),
-        "memory_available_bytes": system.available_memory(),
-        "os_name": os_name,
-        "os_version": os_version,
-        "os_long_version": os_long_version,
-        "host_name": host_name,
-        "uptime_seconds": uptime_seconds,
-    }))
-}
-
-#[derive(Debug)]
-struct ProcessSnapshot {
-    pid: u32,
-    name: String,
-    cpu_usage_percent: f32,
-    memory_bytes: u64,
-}
-
-fn top_processes_data(limit: usize, sort: ProcessSort) -> Result<Vec<Value>, String> {
-    let mut system = System::new().map_err(|error| error.to_string())?;
-    let refresh = ProcessRefreshKind::nothing().with_cpu().with_memory();
-    system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
-    std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
-    system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
-
-    let processes = system
-        .processes()
-        .iter()
-        .map(|(pid, process)| ProcessSnapshot {
-            pid: pid.as_u32(),
-            name: process.name().to_string_lossy().into_owned(),
-            cpu_usage_percent: process.cpu_usage(),
-            memory_bytes: process.memory(),
-        })
-        .collect();
-    Ok(sort_processes(processes, limit, sort))
-}
-
-fn sort_processes(
-    mut processes: Vec<ProcessSnapshot>,
-    limit: usize,
-    sort: ProcessSort,
-) -> Vec<Value> {
-    match sort {
-        ProcessSort::Cpu => processes
-            .sort_by(|left, right| right.cpu_usage_percent.total_cmp(&left.cpu_usage_percent)),
-        ProcessSort::Memory => {
-            processes.sort_by_key(|process| std::cmp::Reverse(process.memory_bytes))
-        }
-    }
-
-    processes
-        .into_iter()
-        .take(limit)
-        .map(|process| {
-            json!({
-                "pid": process.pid,
-                "name": process.name,
-                "cpu_usage_percent": process.cpu_usage_percent,
-                "memory_bytes": process.memory_bytes,
-            })
-        })
-        .collect()
-}
-
-fn port_lookup_data(ports: &[u16], compact: bool) -> Result<Value, String> {
-    if ports.is_empty() {
-        return Err("Provide at least one TCP port to check.".to_owned());
-    }
-    if ports.len() > MAX_PORTS_PER_REQUEST {
-        return Err(format!(
-            "A request may check at most {MAX_PORTS_PER_REQUEST} TCP ports."
-        ));
-    }
-
-    let sockets = get_sockets_info(
-        AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6,
-        ProtocolFlags::TCP,
-    )
-    .map_err(|error| format!("Could not inspect local TCP sockets: {error}"))?;
-
-    let mut system = System::new().ok();
-    if let Some(system) = system.as_mut() {
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-        );
-    }
-
-    let entries: Vec<Value> = ports
-        .iter()
-        .map(|port| {
-            let mut owners = BTreeMap::<u32, Value>::new();
-            for socket in &sockets {
-                let ProtocolSocketInfo::Tcp(tcp) = &socket.protocol_socket_info else {
-                    continue;
-                };
-                if tcp.local_port != *port || tcp.state != TcpState::Listen {
-                    continue;
-                }
-
-                for pid in &socket.associated_pids {
-                    let process = system
-                        .as_ref()
-                        .and_then(|system| system.processes().iter().find(|(candidate, _)| {
-                            candidate.as_u32() == *pid
-                        }));
-                    let owner = match process {
-                        Some((_, process)) => json!({
-                            "pid": pid,
-                            "process_name": process.name().to_string_lossy(),
-                            "command_line": process.cmd().iter()
-                                .map(|part| part.to_string_lossy())
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                            "attribution_status": "available",
-                        }),
-                        None => json!({
-                            "pid": pid,
-                            "process_name": null,
-                            "command_line": null,
-                            "attribution_status": "process_details_unavailable",
-                        }),
-                    };
-                    owners.insert(*pid, owner);
-                }
-            }
-
-            let listening = !owners.is_empty()
-                || sockets.iter().any(|socket| {
-                    matches!(
-                        &socket.protocol_socket_info,
-                        ProtocolSocketInfo::Tcp(tcp)
-                            if tcp.local_port == *port && tcp.state == TcpState::Listen
-                    )
-                });
-            let owner_values: Vec<Value> = owners.into_values().collect();
-            if compact {
-                json!({
-                    "port": port,
-                    "listening": listening,
-                    "owner_pids": owner_values.iter().filter_map(|owner| owner["pid"].as_u64()).collect::<Vec<_>>(),
-                    "attribution_available": !owner_values.is_empty(),
-                })
-            } else {
-                json!({
-                    "port": port,
-                    "listening": listening,
-                    "owners": owner_values,
-                    "attribution_available": !owner_values.is_empty(),
-                    "attribution_note": if owner_values.is_empty() && listening {
-                        Some("The socket is listening, but the operating system did not expose its PID. Elevated permissions may be required.")
-                    } else {
-                        None
-                    },
-                })
-            }
-        })
-        .collect();
-    Ok(json!({ "ports": entries }))
-}
-
-fn gpu_telemetry_data() -> Result<Vec<Value>, String> {
-    let nvml = Nvml::init().map_err(|error| error.to_string())?;
-    let count = nvml.device_count().map_err(|error| error.to_string())?;
-    if count == 0 {
-        return Err("NVML found no NVIDIA GPUs.".to_owned());
-    }
-
-    (0..count)
-        .map(|index| {
-            let device = nvml
-                .device_by_index(index)
-                .map_err(|error| error.to_string())?;
-            let memory = device.memory_info().map_err(|error| error.to_string())?;
-            let temperature = device
-                .temperature(TemperatureSensor::Gpu)
-                .map_err(|error| error.to_string())?;
-            let utilization = device
-                .utilization_rates()
-                .map_err(|error| error.to_string())?;
-
-            Ok(json!({
-                "index": index,
-                "name": device.name().map_err(|error| error.to_string())?,
-                "vram_total_bytes": memory.total,
-                "vram_used_bytes": memory.used,
-                "vram_free_bytes": memory.free,
-                "temperature_celsius": temperature,
-                "gpu_utilization_percent": utilization.gpu,
-                "memory_utilization_percent": utilization.memory,
-            }))
-        })
-        .collect()
-}
-
 fn gpu_unavailable_result(message: String) -> CallToolResult {
     CallToolResult::structured_error(json!({
         "error_code": "GPU_TELEMETRY_UNAVAILABLE",
@@ -735,6 +519,21 @@ fn compact_process_result(result: &Value) -> Value {
         "sort": sort,
         "returned_count": processes.len(),
         "top_process": top_process,
+    })
+}
+
+fn compact_port_result(result: &Value) -> Value {
+    let ports = result["ports"].as_array().cloned().unwrap_or_default();
+    json!({
+        "ports": ports.iter().map(|port| json!({
+            "port": port["port"],
+            "listening": port["listening"],
+            "owner_pids": port["owners"].as_array().into_iter()
+                .flatten()
+                .filter_map(|owner| owner["pid"].as_u64())
+                .collect::<Vec<_>>(),
+            "attribution_available": port["attribution_available"],
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -1034,17 +833,17 @@ fn count_dirty_files(status: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiagnoseBottleneckArguments, PrePushCheckArguments, ProcessSnapshot, ProcessSort,
-        RepoStatusError, SysPulseServer, compact_gpu_result, compact_process_result,
-        count_dirty_files, gpu_unavailable_result, resolve_repo_path, sort_processes,
+        DiagnoseBottleneckArguments, PrePushCheckArguments, ProcessSort, RepoStatusError,
+        SysPulseServer, TopProcessesInput, compact_gpu_result, compact_port_result,
+        compact_process_result, count_dirty_files, gpu_unavailable_result, resolve_repo_path,
         workspace_cache_sizes,
     };
     use rmcp::{ServerHandler, handler::server::wrapper::Parameters};
     use serde_json::json;
     use std::{
         fs,
-        net::TcpListener,
         path::PathBuf,
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1131,7 +930,10 @@ mod tests {
 
     #[test]
     fn advertises_tools_prompts_and_resources() {
-        let server = SysPulseServer::new().expect("server should use its default allowed base");
+        let server = SysPulseServer::with_mock_provider(vec![
+            std::env::current_dir().expect("current directory should be available"),
+        ])
+        .expect("mock-backed server should use its default allowed base");
         let info = server.get_info();
 
         assert!(info.capabilities.tools.is_some());
@@ -1141,7 +943,10 @@ mod tests {
 
     #[test]
     fn bottleneck_prompt_includes_symptom_and_optional_workload() {
-        let server = SysPulseServer::new().expect("server should use its default allowed base");
+        let server = SysPulseServer::with_mock_provider(vec![
+            std::env::current_dir().expect("current directory should be available"),
+        ])
+        .expect("mock-backed server should use its default allowed base");
         let prompt = server.diagnose_bottleneck(Parameters(DiagnoseBottleneckArguments {
             symptom: "slow builds".to_owned(),
             workload: Some("parallel Rust compilation".to_owned()),
@@ -1155,7 +960,10 @@ mod tests {
 
     #[test]
     fn pre_push_prompt_reports_repository_status_or_validation_error() {
-        let server = SysPulseServer::new().expect("server should use its default allowed base");
+        let server = SysPulseServer::with_mock_provider(vec![
+            std::env::current_dir().expect("current directory should be available"),
+        ])
+        .expect("mock-backed server should use its default allowed base");
         let prompt = server.pre_push_check(Parameters(PrePushCheckArguments {
             path: "../outside".to_owned(),
         }));
@@ -1166,62 +974,60 @@ mod tests {
     }
 
     #[test]
-    fn sorts_processes_by_cpu_or_memory_and_applies_limit() {
-        let processes = vec![
-            ProcessSnapshot {
-                pid: 1,
-                name: "small-memory".to_owned(),
-                cpu_usage_percent: 70.0,
-                memory_bytes: 10,
-            },
-            ProcessSnapshot {
-                pid: 2,
-                name: "large-memory".to_owned(),
-                cpu_usage_percent: 5.0,
-                memory_bytes: 100,
-            },
-        ];
+    fn mock_provider_drives_process_and_port_handlers_deterministically() {
+        let server = SysPulseServer::with_mock_provider(vec![
+            std::env::current_dir().expect("current directory should be available"),
+        ])
+        .expect("mock-backed server should initialize");
+        let processes = server.top_processes(Parameters(TopProcessesInput {
+            limit: Some(1),
+            sort: Some(ProcessSort::Cpu),
+            compact: Some(false),
+        }));
+        let process_data = processes
+            .structured_content
+            .expect("structured process result");
+        assert_eq!(process_data["processes"][0]["name"], "mock-indexer");
+        assert_eq!(process_data["processes"].as_array().unwrap().len(), 1);
 
-        let by_cpu = sort_processes(
-            vec![
-                ProcessSnapshot {
-                    pid: 1,
-                    name: "small-memory".to_owned(),
-                    cpu_usage_percent: 70.0,
-                    memory_bytes: 10,
-                },
-                ProcessSnapshot {
-                    pid: 2,
-                    name: "large-memory".to_owned(),
-                    cpu_usage_percent: 5.0,
-                    memory_bytes: 100,
-                },
-            ],
-            1,
-            ProcessSort::Cpu,
-        );
-        let by_memory = sort_processes(processes, 1, ProcessSort::Memory);
-
-        assert_eq!(by_cpu[0]["name"], "small-memory");
-        assert_eq!(by_memory[0]["name"], "large-memory");
-        assert_eq!(by_cpu.len(), 1);
-        assert_eq!(by_memory.len(), 1);
+        let ports = server.port_check(Parameters(super::PortCheckInput {
+            ports: vec![8080, 9000],
+            compact: Some(true),
+        }));
+        let port_data = ports.structured_content.expect("structured port result");
+        assert_eq!(port_data["ports"][0]["listening"], true);
+        assert_eq!(port_data["ports"][0]["owner_pids"][0], 7);
+        assert_eq!(port_data["ports"][1]["listening"], false);
     }
 
     #[test]
-    fn checks_a_listening_local_port_and_rejects_empty_or_oversized_lists() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("local port should bind");
-        let port = listener
-            .local_addr()
-            .expect("listener has a local address")
-            .port();
+    fn rejects_empty_or_oversized_port_requests_before_provider_lookup() {
+        let server = SysPulseServer::with_mock_provider(vec![
+            std::env::current_dir().expect("current directory should be available"),
+        ])
+        .expect("mock-backed server should initialize");
+        for ports in [Vec::new(), vec![1; 65]] {
+            let result = server.port_check(Parameters(super::PortCheckInput {
+                ports,
+                compact: None,
+            }));
+            assert_eq!(result.is_error, Some(true));
+        }
+    }
 
-        let result =
-            super::port_lookup_data(&[port], false).expect("single port should be inspected");
-        let entry = result["ports"][0].clone();
-        assert_eq!(entry["listening"], true);
-        assert!(super::port_lookup_data(&[], false).is_err());
-        assert!(super::port_lookup_data(&vec![1; 65], false).is_err());
+    #[test]
+    fn compact_port_result_omits_process_details() {
+        let result = compact_port_result(&json!({
+            "ports": [{
+                "port": 8080,
+                "listening": true,
+                "owners": [{"pid": 7, "process_name": "secret", "command_line": "details"}],
+                "attribution_available": true,
+            }]
+        }));
+
+        assert_eq!(result["ports"][0]["owner_pids"][0], 7);
+        assert!(result["ports"][0].get("owners").is_none());
     }
 
     #[test]
@@ -1242,9 +1048,10 @@ mod tests {
 
     #[test]
     fn server_rejects_nonexistent_allow_directories() {
-        let error = SysPulseServer::with_allowed_bases(vec![PathBuf::from(
-            "a-directory-that-does-not-exist",
-        )])
+        let error = SysPulseServer::with_allowed_bases_and_provider(
+            vec![PathBuf::from("a-directory-that-does-not-exist")],
+            Arc::new(crate::telemetry::MockTelemetryProvider::default()),
+        )
         .err()
         .expect("missing base directory must fail startup");
 
