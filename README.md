@@ -1,22 +1,31 @@
 # sys-pulse-mcp
 
+[![CI](https://github.com/Zepyrnex/sys-pulse-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Zepyrnex/sys-pulse-mcp/actions/workflows/ci.yml)
+
 A read-only, stdio-based [Model Context Protocol](https://modelcontextprotocol.io/)
 server for local system telemetry, Git status, and practical diagnostics. Built
 with Rust, [`rmcp`](https://crates.io/crates/rmcp), Tokio, and `sysinfo`.
 
 ## Features
 
-- System CPU, memory, operating-system, and uptime telemetry.
+- Current CPU, memory, swap, operating-system, and uptime telemetry.
+- A background sampler with a bounded 150-sample history (about five minutes
+  at the default two-second interval), rolling statistics, CPU p95, and memory
+  growth rate.
 - Mounted disk usage and top-process inspection by CPU or resident memory.
-- Local loopback TCP listening-port checks and optional NVIDIA GPU telemetry.
-- Allowlisted, read-only Git repository status and a corresponding MCP resource.
+- Local TCP listening-port attribution to PIDs, process names, and command
+  lines, with a graceful fallback when the operating system withholds details.
+- Optional NVIDIA GPU telemetry through NVML.
+- Allowlisted Git repository status, build-cache sizing, and unpushed commit
+  counts.
+- Compact output options for verbose diagnostic tools.
 - Structured diagnosis and pre-push prompt workflows.
-- Stdio JSON-RPC is kept on stdout; diagnostic logs are sent to stderr.
+- Stdio JSON-RPC is kept on stdout; diagnostic and sampler logs go to stderr.
 
 ## Requirements
 
 - Rust 1.95 or newer.
-- Git on `PATH` for repository tools and resources.
+- Git on `PATH` for repository tools, resources, and prompts.
 - NVIDIA drivers/NVML and a supported NVIDIA GPU only for `gpu_telemetry`.
   Other tools work without NVIDIA hardware.
 
@@ -34,6 +43,10 @@ working directory. Configured directories are canonicalized and validated at
 startup. Repository lookups reject absolute paths, parent traversal, and paths
 that resolve outside those bases.
 
+Use `--sample-interval-secs <seconds>` to change the background sampling
+interval (1–3600 seconds; default 2). The equivalent environment variable is
+`SYS_PULSE_SAMPLE_INTERVAL_SECS`.
+
 The server communicates over standard input/output and is intended to be
 launched by an MCP client. Do not pipe other application output to stdout.
 Tracing output is configured to stderr.
@@ -47,20 +60,31 @@ All tools are read-only and use object-shaped JSON input schemas.
 | `system_overview` | `{}` | CPU count and usage, total/available RAM, OS details, host name, and uptime. |
 | `disk_usage` | `{}` | Mounted disks with filesystem, mount point, and total/available bytes. |
 | `repo_status` | `{"path":"relative/repo"}` | Canonical path, branch, dirty-file count, and latest commit summary. |
-| `top_processes` | `{"limit":10,"sort":"cpu"}` | Up to 100 processes, ordered by `cpu` or `memory`; limit defaults to 10. |
-| `port_check` | `{"ports":[80,443]}` | Whether each requested port accepts TCP connections on `127.0.0.1`. |
-| `gpu_telemetry` | `{}` | NVIDIA GPU name, VRAM, temperature, and utilization using NVML. |
+| `top_processes` | `{"limit":10,"sort":"cpu","compact":true}` | Up to 100 processes, ordered by `cpu` or `memory`; limit defaults to 10. `compact` is optional. |
+| `port_check` | `{"ports":[80,443],"compact":true}` | Listening state and process attribution for requested local TCP ports. `compact` omits names and command lines. |
+| `gpu_telemetry` | `{"compact":true}` | NVIDIA GPU name, VRAM, temperature, and utilization using NVML. `compact` returns a short per-device summary. |
+| `workspace_pulse` | `{"path":"relative/repo","compact":true}` | Allowlisted Git status, unpushed count when an upstream is configured, and sizes of common build caches. |
 
-`port_check` only tests loopback and accepts at most 64 ports per call; it does
-not probe remote hosts. `gpu_telemetry` returns a structured tool-level error
-(`GPU_TELEMETRY_UNAVAILABLE`) when NVML or a supported NVIDIA GPU is unavailable.
-Likewise, invalid or non-repository paths return structured tool-level errors
-instead of failing the MCP protocol request.
+`port_check` inspects local listening sockets and their owners; it does not
+probe remote hosts. At most 64 ports may be requested per call. If the operating
+system does not expose a socket's PID or process details, the result indicates
+that elevated permissions may be required. `gpu_telemetry` returns a structured
+tool-level error (`GPU_TELEMETRY_UNAVAILABLE`) when NVML or a supported NVIDIA
+GPU is unavailable. Invalid or non-repository paths likewise return structured
+tool-level errors instead of failing the MCP protocol request.
+
+`workspace_pulse` reports Git branch and dirty state, the number of commits
+ahead of the configured upstream (or an explicit unconfigured status), and
+sizes for `target`, `node_modules`, `.venv`, and `dist`. It only inspects these
+directories and does not execute arbitrary shell commands or follow symlinks.
 
 ## MCP resources
 
 - `sys://telemetry/snapshot` provides a fresh JSON snapshot of CPU, memory, OS,
-  host, and uptime data.
+  host, uptime, and rolling trend statistics.
+- `sys://telemetry/trends` provides the bounded recent CPU, memory, and swap
+  samples and aggregate statistics, including CPU p95 and memory delta in
+  MB/minute.
 - The `sys://repositories/{path}` resource template provides JSON Git status
   for a repository beneath an allowed base directory. The `{path}` value must
   be relative and cannot traverse outside configured roots.
@@ -89,7 +113,9 @@ Example stdio-server configuration for an MCP client that accepts `command` and
       "command": "C:\\Work\\Projects\\sys-pulse-mcp\\target\\release\\sys-pulse-mcp.exe",
       "args": [
         "--allow-dir",
-        "C:\\Work\\Projects"
+        "C:\\Work\\Projects",
+        "--sample-interval-secs",
+        "2"
       ]
     }
   }
@@ -102,16 +128,20 @@ directories. Alternatively, omit those arguments and configure
 
 ## Architecture
 
-- `src/main.rs` configures stderr-only tracing, parses CLI allowlist options,
-  creates the MCP service, and serves it over rmcp's stdio transport.
-- `src/tools.rs` contains the typed tool and prompt routers, MCP resource
-  handlers, telemetry/Git inspection, and path-validation logic.
-- `SYS_PULSE_ALLOWED_BASES` and repeatable `--allow-dir` options define the
-  repository access boundary.
+- `src/main.rs` configures stderr-only tracing, parses CLI options, creates a
+  shared telemetry provider, starts the background sampler, and serves the MCP
+  service over rmcp's stdio transport.
+- `src/telemetry.rs` defines the `TelemetryProvider` boundary, the host-backed
+  `SystemTelemetryProvider`, the test-only deterministic mock provider, and
+  the bounded sample history and trend calculations.
+- `src/tools.rs` contains typed tool and prompt routers, MCP resource handlers,
+  allowlisted repository inspection, workspace cache sizing, and compact
+  response formatting.
 
-The server performs no writes to inspected repositories and invokes Git only
-with argument arrays (never through a shell). Process and port diagnostics are
-restricted to local observation; port checks connect only to IPv4 loopback.
+The provider boundary keeps host-dependent inspection out of MCP handlers so
+their behavior can be tested deterministically without relying on a particular
+machine or an NVIDIA GPU. The server performs no writes to inspected
+repositories and invokes Git with argument arrays, never through a shell.
 
 ## Development
 
@@ -121,5 +151,5 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
-GitHub Actions runs formatting, Clippy, and tests on pushes and pull requests.
-See [CHANGELOG.md](CHANGELOG.md) for the milestone-by-milestone feature history.
+GitHub Actions runs formatting, Clippy, and tests on both Ubuntu and Windows.
+See [CHANGELOG.md](CHANGELOG.md) for the versioned feature history.

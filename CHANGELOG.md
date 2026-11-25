@@ -22,7 +22,7 @@
 ## v0.3 — Documentation & Release History
 
 - docs(readme): document all tools, resources, prompts, allowlist configuration, and MCP client setup.
-- docs(changelog): organize feature history by release milestone with Conventional Commit entries.
+- docs(changelog): organize feature history by version with Conventional Commit entries.
 
 ## v0.4 — Background Telemetry Trends
 
@@ -42,3 +42,9 @@
 - refactor(core): route system, disk, process, GPU, port, and sampler telemetry through a shared `TelemetryProvider`.
 - test(core): add a deterministic mock provider for stable MCP handler and prompt tests without host telemetry dependencies.
 - ci(github-actions): run formatting, Clippy, and tests on Ubuntu and Windows.
+
+## v0.7 — Documentation & Release Polish
+
+- docs(readme): document telemetry trends, port attribution, workspace diagnostics, compact options, and provider architecture.
+- docs(readme): add an Actions status badge and refresh the MCP client configuration and CLI guidance.
+- docs(changelog): audit versioned release history and use consistent Conventional Commit bullets.
