@@ -23,3 +23,9 @@
 
 - docs(readme): document all tools, resources, prompts, allowlist configuration, and MCP client setup.
 - docs(changelog): organize feature history by release milestone with Conventional Commit entries.
+
+## v0.4 — Background Telemetry Trends
+
+- feat(telemetry): sample CPU, memory, and swap on a configurable background interval into a bounded 150-sample ring buffer.
+- feat(mcp): expose `sys://telemetry/trends` and enrich the snapshot resource with rolling CPU/memory/swap statistics, CPU p95, and memory growth rate.
+- test(telemetry): cover ring-buffer eviction, rolling statistics, percentile calculation, and memory delta behavior.

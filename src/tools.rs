@@ -3,6 +3,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::{Component, Path, PathBuf},
     process::{Command, Output},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -22,6 +23,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sysinfo::{Disks, MINIMUM_CPU_UPDATE_INTERVAL, ProcessRefreshKind, ProcessesToUpdate, System};
+
+use crate::telemetry::SampleHistory;
 
 const ALLOWED_BASES_ENV: &str = "SYS_PULSE_ALLOWED_BASES";
 const DEFAULT_PROCESS_LIMIT: usize = 10;
@@ -96,6 +99,7 @@ pub struct SysPulseServer {
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
     allowed_bases: Vec<PathBuf>,
+    sample_history: Arc<RwLock<SampleHistory>>,
 }
 
 impl SysPulseServer {
@@ -135,7 +139,13 @@ impl SysPulseServer {
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             allowed_bases,
+            sample_history: Arc::new(RwLock::new(SampleHistory::default())),
         })
+    }
+
+    pub fn with_sample_history(mut self, history: Arc<RwLock<SampleHistory>>) -> Self {
+        self.sample_history = history;
+        self
     }
 }
 
@@ -346,7 +356,14 @@ impl ServerHandler for SysPulseServer {
     ) -> Result<ListResourcesResult, ErrorData> {
         Ok(ListResourcesResult::with_all_items(vec![
             Resource::new("sys://telemetry/snapshot", "System telemetry snapshot")
-                .with_description("A fresh snapshot of CPU, memory, operating system, and uptime.")
+                .with_description(
+                    "A fresh snapshot of CPU, memory, operating system, uptime, and rolling trends.",
+                )
+                .with_mime_type("application/json"),
+            Resource::new("sys://telemetry/trends", "Telemetry trends")
+                .with_description(
+                    "Bounded recent CPU, memory, and swap samples with rolling statistics.",
+                )
                 .with_mime_type("application/json"),
         ]))
     }
@@ -371,11 +388,31 @@ impl ServerHandler for SysPulseServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         let contents = if request.uri == "sys://telemetry/snapshot" {
-            let snapshot = system_overview_data().map_err(|error| {
+            let mut snapshot = system_overview_data().map_err(|error| {
                 ErrorData::internal_error(format!("Could not collect telemetry: {error}"), None)
             })?;
+            let trends = self.sample_history.read().map_err(|error| {
+                ErrorData::internal_error(
+                    format!("Could not read telemetry history: {error}"),
+                    None,
+                )
+            })?;
+            if let Some(snapshot) = snapshot.as_object_mut() {
+                snapshot.insert("trends".to_owned(), trends.trends());
+            }
             let text = serde_json::to_string_pretty(&snapshot).map_err(|error| {
                 ErrorData::internal_error(format!("Could not serialize telemetry: {error}"), None)
+            })?;
+            ResourceContents::text(text, request.uri)
+        } else if request.uri == "sys://telemetry/trends" {
+            let trends = self.sample_history.read().map_err(|error| {
+                ErrorData::internal_error(
+                    format!("Could not read telemetry history: {error}"),
+                    None,
+                )
+            })?;
+            let text = serde_json::to_string_pretty(&trends.trends()).map_err(|error| {
+                ErrorData::internal_error(format!("Could not serialize trends: {error}"), None)
             })?;
             ResourceContents::text(text, request.uri)
         } else if let Some(path) = request.uri.strip_prefix("sys://repositories/") {
