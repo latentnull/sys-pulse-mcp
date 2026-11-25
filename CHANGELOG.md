@@ -29,3 +29,10 @@
 - feat(telemetry): sample CPU, memory, and swap on a configurable background interval into a bounded 150-sample ring buffer.
 - feat(mcp): expose `sys://telemetry/trends` and enrich the snapshot resource with rolling CPU/memory/swap statistics, CPU p95, and memory growth rate.
 - test(telemetry): cover ring-buffer eviction, rolling statistics, percentile calculation, and memory delta behavior.
+
+## v0.5 — Workspace & Port Diagnostics
+
+- feat(diagnostics): attribute local listening TCP ports to owning PIDs, process names, and command lines with a clear permission fallback.
+- feat(workspace): report allowlisted Git status, upstream commit count, and sizes of common build caches without following symlinks.
+- feat(diagnostics): add compact summaries for process, port, GPU, and workspace diagnostics.
+- test(diagnostics): cover cache sizing, compact output, path validation, and local port lookup.
